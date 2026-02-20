@@ -268,8 +268,12 @@ static int sample_advanced(float *logits,
         for (int i = 0; i < n_cand; i++)
             probs[i].val *= inv_sum;
 
-        /* Step 8: Sort k candidates descending */
-        qsort(probs, n_cand, sizeof(token_prob_t), compare_token_prob_desc);
+        /* Step 8: Sort k candidates descending (skip if top_p inactive --
+         * CDF sampling is order-independent, so sort is only needed for
+         * top_p's cumulative probability walk).
+         */
+        if (top_p < 1.0f)
+            qsort(probs, n_cand, sizeof(token_prob_t), compare_token_prob_desc);
 
         /* Step 9: filter_and_sample with min_p=0 (already filtered) */
         return filter_and_sample(probs, n_cand, 0, top_p, 0);
@@ -308,7 +312,50 @@ static int sample_advanced(float *logits,
     for (int i = 0; i < n_cand; i++)
         probs[i].val *= inv_sum;
 
-    /* Full sort of filtered set + sampling */
+    /* Lazy sort: when top_p is inactive AND top_k won't truncate, CDF
+     * sampling is order-independent -- skip the O(n log n) sort entirely.
+     * Must still sort when top_k < n_cand, because filter_and_sample's
+     * top_k truncation needs descending probability order. */
+    if (top_p >= 1.0f && (top_k <= 0 || top_k >= n_cand))
+        return filter_and_sample(probs, n_cand, 0, top_p, top_k);
+
+    /* Adaptive partial sort for top-p: select top-256 via min-heap, sort
+     * only those, and check if their cumulative probability mass covers
+     * the top_p threshold. Avoids full O(V log V) sort when top_p is
+     * high (p=0.9 typically satisfied by top-50 candidates).
+     */
+    enum { PARTIAL_K = 256 };
+    if (top_p < 1.0f && n_cand > PARTIAL_K) {
+        token_prob_t top_buf[PARTIAL_K];
+        memcpy(top_buf, probs, PARTIAL_K * sizeof(token_prob_t));
+
+        /* Build min-heap (root = smallest of top set) */
+        for (int i = PARTIAL_K / 2 - 1; i >= 0; i--)
+            heap_sift_down(top_buf, PARTIAL_K, i);
+
+        /* Scan remaining, evict root if a larger element is found */
+        for (int i = PARTIAL_K; i < n_cand; i++) {
+            if (probs[i].val > top_buf[0].val) {
+                top_buf[0] = probs[i];
+                heap_sift_down(top_buf, PARTIAL_K, 0);
+            }
+        }
+
+        /* Sort top-256 descending for cumulative probability walk */
+        qsort(top_buf, PARTIAL_K, sizeof(token_prob_t),
+              compare_token_prob_desc);
+
+        /* Check if top-256 covers enough probability mass for top_p */
+        double cs = 0.0;
+        for (int i = 0; i < PARTIAL_K; i++) {
+            cs += top_buf[i].val;
+            if (cs >= top_p)
+                return filter_and_sample(top_buf, PARTIAL_K, 0, top_p, top_k);
+        }
+        /* Rare fallback: top-256 insufficient, full sort below */
+    }
+
+    /* Full sort + sampling */
     qsort(probs, n_cand, sizeof(token_prob_t), compare_token_prob_desc);
     return filter_and_sample(probs, n_cand, 0, top_p, top_k);
 }
@@ -648,8 +695,7 @@ bool model_load(bitmamba_model_t *m, const char *path)
             bitmamba_block_t *b = &m->layers[i];
             if (b->conv1d_w.n_elements < (size_t) d_inner * d_conv) {
                 fprintf(stderr, "Error: Layer %d conv1d_w size %zu < %zu\n", i,
-                        b->conv1d_w.n_elements,
-                        (size_t) d_inner * d_conv);
+                        b->conv1d_w.n_elements, (size_t) d_inner * d_conv);
                 goto parse_error;
             }
             if (b->conv1d_b.n_elements < (size_t) d_inner) {
