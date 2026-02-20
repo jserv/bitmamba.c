@@ -1,0 +1,11 @@
+*.bin
+*.pt
+*.msgpack
+bitmamba
+__pycache__
+build
+venv
+*.o
+src/metal/bm_shaders_source.h
+vocab.json
+externals/
