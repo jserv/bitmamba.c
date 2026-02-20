@@ -6,6 +6,11 @@
 #include "dispatch.h"
 #include "threadpool.h"
 
+#if defined(__APPLE__) && !defined(BM_NO_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+#define USE_ACCELERATE 1
+#endif
+
 /*
  * Dot product abstraction: 16 x int8 dot product accumulated into int32x4.
  * With DOTPROD (Apple Silicon, Cortex-A76+): single instruction.
@@ -500,10 +505,12 @@ void neon_bitlinear_forward_batch(const float *restrict x_batch,
     free(scale_x_heap);
 }
 
+#ifndef USE_ACCELERATE
 /*
  * Vectorized expf for NEON (float32x4_t).
  * Polynomial approximation ported from llama.cpp ggml.c.
  * Max relative error ~1.5e-5 over [-87, 88], sufficient for SSM scan.
+ * Used only in the non-Accelerate SSM path (bm_v_silu_nr).
  */
 static inline __attribute__((always_inline)) float32x4_t
 bm_v_expf(float32x4_t x)
@@ -559,13 +566,21 @@ bm_v_silu_nr(float32x4_t x)
     r = vmulq_f32(r, vrecpsq_f32(denom, r));
     return vmulq_f32(x, r);
 }
+#endif /* !USE_ACCELERATE */
 
 /*
  * NEON vectorized SSM inner loop.
- * Double-pumped: 8 elements per iteration (two independent float32x4_t chains)
- * to hide FMA latency via ILP. Falls back to 4-float and scalar remainders.
- * Per-head scalars (softplus, decay) remain scalar (n_heads=64, not worth
- * vectorizing).
+ *
+ * With Accelerate (Apple Silicon): two-pass design batches all exp() calls
+ * via vvexpf, plus vvlog1pf for per-head softplus. This replaces the inline
+ * polynomial approximation with Apple's hardware-tuned implementations.
+ *   Pass 1: conv1d for all elements + collect negated values for batch exp.
+ *   Batch:  vvexpf for silu(conv) and silu(z).
+ *   Pass 2: per-head SSM state update using pre-computed silu results.
+ * Disable with BM_NO_ACCELERATE=1 at build time.
+ *
+ * Without Accelerate: single-pass with inline polynomial exp (bm_v_silu_nr).
+ * Double-pumped ILP (8 elements/iter) hides FMA latency.
  */
 void neon_ssm_inner(const ssm_inner_args_t *a, int idx_start, int idx_end)
 {
@@ -576,6 +591,192 @@ void neon_ssm_inner(const ssm_inner_args_t *a, int idx_start, int idx_end)
     const float *cw_tap1 = a->conv1d_w_t + d_inner;
     const float *cw_tap2 = a->conv1d_w_t + 2 * d_inner;
     const float *cw_tap3 = a->conv1d_w_t + 3 * d_inner;
+
+#ifdef USE_ACCELERATE
+    int n = idx_end - idx_start;
+    if (n <= 0)
+        return;
+
+    /* --- Pre-compute per-head scalars via batch Accelerate ---
+     * softplus(x) = log(1 + exp(x)) via vvexpf + vvlog1pf.
+     * decay = exp(A_precomp * dt_val) via vvexpf.
+     * Batches all heads in [idx_start, idx_end) in 3 Accelerate calls. */
+    int h_first = idx_start / head_dim;
+    int h_last = (idx_end - 1) / head_dim + 1;
+    int nh = h_last - h_first;
+    float dt_raw[nh], sp_buf[nh], decay_buf[nh], bdt_buf[nh], c_buf[nh];
+
+    for (int i = 0; i < nh; i++)
+        dt_raw[i] = a->ptr_dt[h_first + i] + a->dt_bias[h_first + i];
+
+    vvexpf(sp_buf, dt_raw, &nh);
+    vvlog1pf(sp_buf, sp_buf, &nh);
+    for (int i = 0; i < nh; i++) {
+        if (dt_raw[i] > 20.0f)
+            sp_buf[i] = dt_raw[i]; /* overflow guard */
+    }
+
+    for (int i = 0; i < nh; i++) {
+        int h = h_first + i;
+        decay_buf[i] = a->A_precomp[h] * sp_buf[i];
+        bdt_buf[i] = a->ptr_B[h] * sp_buf[i];
+        c_buf[i] = a->ptr_C[h];
+    }
+    vvexpf(decay_buf, decay_buf, &nh);
+
+    /* --- Pass 1: conv1d + negate for batch exp ---
+     * Head-independent: flat NEON sweep over [idx_start, idx_end). */
+    float conv_buf[n]; /* conv1d results (silu numerator) */
+    float exp_conv[n]; /* -> exp(-conv) -> silu(conv) */
+    float exp_z[n];    /* -> exp(-z)    -> silu(z) */
+
+    int d = idx_start;
+    int off = 0;
+
+    for (; off + 8 <= n; off += 8, d += 8) {
+        float32x4_t c_a = vld1q_f32(a->conv1d_b + d);
+        float32x4_t c_b = vld1q_f32(a->conv1d_b + d + 4);
+
+        c_a = vfmaq_f32(c_a, vld1q_f32(a->cs0 + d), vld1q_f32(cw_tap0 + d));
+        c_b = vfmaq_f32(c_b, vld1q_f32(a->cs0 + d + 4),
+                        vld1q_f32(cw_tap0 + d + 4));
+        c_a = vfmaq_f32(c_a, vld1q_f32(a->cs1 + d), vld1q_f32(cw_tap1 + d));
+        c_b = vfmaq_f32(c_b, vld1q_f32(a->cs1 + d + 4),
+                        vld1q_f32(cw_tap1 + d + 4));
+        c_a = vfmaq_f32(c_a, vld1q_f32(a->cs2 + d), vld1q_f32(cw_tap2 + d));
+        c_b = vfmaq_f32(c_b, vld1q_f32(a->cs2 + d + 4),
+                        vld1q_f32(cw_tap2 + d + 4));
+
+        float32x4_t in_a = vld1q_f32(a->ptr_x + d);
+        float32x4_t in_b = vld1q_f32(a->ptr_x + d + 4);
+        c_a = vfmaq_f32(c_a, in_a, vld1q_f32(cw_tap3 + d));
+        c_b = vfmaq_f32(c_b, in_b, vld1q_f32(cw_tap3 + d + 4));
+
+        vst1q_f32(a->cs_write + d, in_a);
+        vst1q_f32(a->cs_write + d + 4, in_b);
+
+        vst1q_f32(conv_buf + off, c_a);
+        vst1q_f32(conv_buf + off + 4, c_b);
+        vst1q_f32(exp_conv + off, vnegq_f32(c_a));
+        vst1q_f32(exp_conv + off + 4, vnegq_f32(c_b));
+        vst1q_f32(exp_z + off, vnegq_f32(vld1q_f32(a->ptr_z + d)));
+        vst1q_f32(exp_z + off + 4, vnegq_f32(vld1q_f32(a->ptr_z + d + 4)));
+    }
+
+    for (; off + 4 <= n; off += 4, d += 4) {
+        float32x4_t c = vld1q_f32(a->conv1d_b + d);
+        c = vfmaq_f32(c, vld1q_f32(a->cs0 + d), vld1q_f32(cw_tap0 + d));
+        c = vfmaq_f32(c, vld1q_f32(a->cs1 + d), vld1q_f32(cw_tap1 + d));
+        c = vfmaq_f32(c, vld1q_f32(a->cs2 + d), vld1q_f32(cw_tap2 + d));
+        float32x4_t in = vld1q_f32(a->ptr_x + d);
+        c = vfmaq_f32(c, in, vld1q_f32(cw_tap3 + d));
+        vst1q_f32(a->cs_write + d, in);
+        vst1q_f32(conv_buf + off, c);
+        vst1q_f32(exp_conv + off, vnegq_f32(c));
+        vst1q_f32(exp_z + off, vnegq_f32(vld1q_f32(a->ptr_z + d)));
+    }
+
+    for (; off < n; off++, d++) {
+        float input_x = a->ptr_x[d];
+        float cv = a->conv1d_b[d] + a->cs0[d] * cw_tap0[d] +
+                   a->cs1[d] * cw_tap1[d] + a->cs2[d] * cw_tap2[d] +
+                   input_x * cw_tap3[d];
+        a->cs_write[d] = input_x;
+        conv_buf[off] = cv;
+        exp_conv[off] = -cv;
+        exp_z[off] = -a->ptr_z[d];
+    }
+
+    /* --- Batch exp via Accelerate vvexpf --- */
+    vvexpf(exp_conv, exp_conv, &n);
+    vvexpf(exp_z, exp_z, &n);
+
+    /* --- Compute silu = x / (1 + exp(-x)) ---
+     * Apple Silicon vdivq_f32 has 1-cycle throughput; true divide is
+     * both faster and more accurate than NR reciprocal on M-series. */
+    float32x4_t v_one = vdupq_n_f32(1.0f);
+    off = 0;
+    d = idx_start;
+    for (; off + 4 <= n; off += 4, d += 4) {
+        float32x4_t dc = vaddq_f32(v_one, vld1q_f32(exp_conv + off));
+        vst1q_f32(exp_conv + off, vdivq_f32(vld1q_f32(conv_buf + off), dc));
+        float32x4_t dz = vaddq_f32(v_one, vld1q_f32(exp_z + off));
+        vst1q_f32(exp_z + off, vdivq_f32(vld1q_f32(a->ptr_z + d), dz));
+    }
+    for (; off < n; off++, d++) {
+        exp_conv[off] = conv_buf[off] / (1.0f + exp_conv[off]);
+        exp_z[off] = a->ptr_z[d] / (1.0f + exp_z[off]);
+    }
+    /* exp_conv[] = silu(conv), exp_z[] = silu(z) */
+
+    /* --- Pass 2: per-head SSM state update --- */
+    int idx = idx_start;
+    while (idx < idx_end) {
+        int h = idx / head_dim;
+        int head_end = (h + 1) * head_dim;
+        if (head_end > idx_end)
+            head_end = idx_end;
+
+        int hi = h - h_first;
+        float decay_s = decay_buf[hi];
+        float Bdt_s = bdt_buf[hi];
+        float C_s = c_buf[hi];
+
+        float32x4_t v_decay = vdupq_n_f32(decay_s);
+        float32x4_t v_Bdt = vdupq_n_f32(Bdt_s);
+        float32x4_t v_C = vdupq_n_f32(C_s);
+
+        d = idx;
+        off = d - idx_start;
+
+        for (; d + 8 <= head_end; d += 8, off += 8) {
+            float32x4_t xa_a = vld1q_f32(exp_conv + off);
+            float32x4_t xa_b = vld1q_f32(exp_conv + off + 4);
+
+            float32x4_t st_a = vld1q_f32(a->ssm_state + d);
+            float32x4_t st_b = vld1q_f32(a->ssm_state + d + 4);
+            st_a = vfmaq_f32(vmulq_f32(xa_a, v_Bdt), st_a, v_decay);
+            st_b = vfmaq_f32(vmulq_f32(xa_b, v_Bdt), st_b, v_decay);
+            vst1q_f32(a->ssm_state + d, st_a);
+            vst1q_f32(a->ssm_state + d + 4, st_b);
+
+            float32x4_t za_a = vld1q_f32(exp_z + off);
+            float32x4_t za_b = vld1q_f32(exp_z + off + 4);
+            vst1q_f32(a->y + d,
+                      vmulq_f32(vfmaq_f32(vmulq_f32(xa_a, vld1q_f32(a->D + d)),
+                                          st_a, v_C),
+                                za_a));
+            vst1q_f32(
+                a->y + d + 4,
+                vmulq_f32(vfmaq_f32(vmulq_f32(xa_b, vld1q_f32(a->D + d + 4)),
+                                    st_b, v_C),
+                          za_b));
+        }
+
+        for (; d + 4 <= head_end; d += 4, off += 4) {
+            float32x4_t x_act = vld1q_f32(exp_conv + off);
+            float32x4_t state = vld1q_f32(a->ssm_state + d);
+            state = vfmaq_f32(vmulq_f32(x_act, v_Bdt), state, v_decay);
+            vst1q_f32(a->ssm_state + d, state);
+
+            float32x4_t z_act = vld1q_f32(exp_z + off);
+            vst1q_f32(a->y + d,
+                      vmulq_f32(vfmaq_f32(vmulq_f32(x_act, vld1q_f32(a->D + d)),
+                                          state, v_C),
+                                z_act));
+        }
+
+        for (; d < head_end; d++, off++) {
+            float x_act = exp_conv[off];
+            float state = a->ssm_state[d] * decay_s + x_act * Bdt_s;
+            a->ssm_state[d] = state;
+            a->y[d] = (state * C_s + x_act * a->D[d]) * exp_z[off];
+        }
+
+        idx = head_end;
+    }
+
+#else /* !USE_ACCELERATE: inline polynomial path */
 
     int idx = idx_start;
 
@@ -687,6 +888,8 @@ void neon_ssm_inner(const ssm_inner_args_t *a, int idx_start, int idx_end)
 
         idx = head_end;
     }
+
+#endif /* USE_ACCELERATE */
 }
 
 /*
