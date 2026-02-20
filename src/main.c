@@ -54,6 +54,8 @@ int main(int argc, char **argv)
     bool use_gpu = false;
     bool profile_enabled = false;
     int requested_threads = 0; /* 0 = auto-detect */
+    bool seed_set = false;
+    uint64_t seed = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--profile") == 0) {
             profile_enabled = true;
@@ -73,6 +75,21 @@ int main(int argc, char **argv)
                 argv[j] = argv[j + 2];
             argc -= 2;
             i--;
+        } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            char *endptr;
+            errno = 0;
+            seed = (uint64_t) strtoull(argv[i + 1], &endptr, 10);
+            if (endptr == argv[i + 1] || *endptr != '\0' || errno == ERANGE ||
+                argv[i + 1][0] == '-') {
+                fprintf(stderr, "Error: Invalid --seed value '%s'\n",
+                        argv[i + 1]);
+                return 1;
+            }
+            seed_set = true;
+            for (int j = i; j < argc - 2; j++)
+                argv[j] = argv[j + 2];
+            argc -= 2;
+            i--;
         } else if (strcmp(argv[i], "--poll") == 0 && i + 1 < argc) {
             bm_set_poll(parse_int(argv[i + 1], 100));
             for (int j = i; j < argc - 2; j++)
@@ -88,7 +105,8 @@ int main(int argc, char **argv)
 
     if (argc < 4) {
         fprintf(stderr,
-                "Usage: %s [--profile] [--gpu] [--threads N] [--poll 0-100] "
+                "Usage: %s [--profile] [--gpu] [--threads N] [--seed N] "
+                "[--poll 0-100] "
                 "<model.bin> <input> <mode> "
                 "[temp] [penalty] [min_p] [top_p] [top_k] [max_tokens] "
                 "[output_mode]\n",
@@ -101,6 +119,9 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "  --threads N - Set thread count (0=auto, 1=single, "
                 "default: auto)\n");
+        fprintf(stderr,
+                "  --seed N    - Fixed PRNG seed for reproducible "
+                "sampling (default: time-based)\n");
         fprintf(stderr,
                 "  --poll 0-100 - Poll intensity (0=condvar, 100=spin, "
                 "default: 100)\n");
@@ -286,7 +307,7 @@ int main(int argc, char **argv)
     if (!is_clean)
         fprintf(stderr, "[INFO] Generating tokens...\n");
 
-    rng_seed((uint64_t) time(NULL));
+    rng_seed(seed_set ? (seed ? seed : 1) : (uint64_t) time(NULL));
 
     int *generated_tokens = xmalloc(max_tokens * sizeof(int));
     int n_generated = 0;
