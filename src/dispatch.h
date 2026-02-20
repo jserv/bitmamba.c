@@ -80,7 +80,7 @@ typedef struct {
     int cols;
     int packed_stride;
     _Atomic int *chunk_ctr; /* NULL = static partition (NUMA or disabled) */
-    int chunk_size;         /* rows per chunk (multiple of 4 for AVX2/NEON) */
+    int chunk_size;         /* rows per chunk (multiple of 8 for AVX2/NEON) */
 } bitlinear_row_work_t;
 
 /* Dispatch table: populated once at startup by dispatch_init() */

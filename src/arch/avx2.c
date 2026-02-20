@@ -85,6 +85,16 @@ float avx2_rms_norm(const float *restrict x,
 /*
  * Process rows [r_start, r_end) for AVX2 bitlinear forward.
  * Extracted helper for use by both static-partition and work-stealing paths.
+ *
+ * 8-row primary unrolling amortizes activation deinterleave across 8 rows.
+ * Falls through to 4-row and 1-row remainders.
+ * X-macros (ROWS_8/ROWS_4) eliminate per-row boilerplate duplication.
+ *
+ * Register budget (16 YMM): 8 accumulators + x_u + 6 decode constants
+ * + 3 temporaries = 18, but deint_shuf/deint_perm are dead during
+ * the decode sequence (only live during activation load), so the compiler
+ * reclaims those 2 registers. Peak = 16 = exact fit.
+ * Verify no accumulator spills: objdump -d | grep 'vmovdqa.*\[rsp'
  */
 static void avx2_row_block(bitlinear_row_work_t *w, int r_start, int r_end)
 {
@@ -108,29 +118,11 @@ static void avx2_row_block(bitlinear_row_work_t *w, int r_start, int r_end)
                          0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
     __m256i deint_perm = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
 
-    int r = r_start;
-
-    /* 4-row unrolling */
-    for (; r + 4 <= r_end; r += 4) {
-        __m256i acc0 = _mm256_setzero_si256();
-        __m256i acc1 = _mm256_setzero_si256();
-        __m256i acc2 = _mm256_setzero_si256();
-        __m256i acc3 = _mm256_setzero_si256();
-        int row0_off = r * packed_stride;
-        int row1_off = row0_off + packed_stride;
-        int row2_off = row1_off + packed_stride;
-        int row3_off = row2_off + packed_stride;
-
-        int c = 0;
-        for (; c + 32 <= cols; c += 32) {
-            int pack_off = c / 4;
-
-            __m256i x_vec =
-                _mm256_loadu_si256((const __m256i *) (x_quant_buf + c));
-            __m256i x_d = _mm256_permutevar8x32_epi32(
-                _mm256_shuffle_epi8(x_vec, deint_shuf), deint_perm);
-            __m256i x_u = _mm256_xor_si256(x_d, offset_val);
-
+    /*
+     * Decode 32 ternary weights from 8 packed bytes via shift-decode,
+     * multiply against deinterleaved activations (x_u), and accumulate.
+     * Requires x_u, pack_off, and SIMD constants in the calling scope.
+     */
 #define DECODE_ROW_W(row_off, acc)                                             \
     do {                                                                       \
         __m128i raw = _mm_loadl_epi64(                                         \
@@ -146,61 +138,82 @@ static void avx2_row_block(bitlinear_row_work_t *w, int r_start, int r_end)
         (acc) = _mm256_add_epi32((acc), _mm256_madd_epi16(prod, ones));        \
     } while (0)
 
-            DECODE_ROW_W(row0_off, acc0);
-            DECODE_ROW_W(row1_off, acc1);
-            DECODE_ROW_W(row2_off, acc2);
-            DECODE_ROW_W(row3_off, acc3);
+    /* Load 32 quantized activations + deinterleave for shift-decode layout */
+#define LOAD_DEINTERLEAVE_ACT(c)                                               \
+    __m256i x_vec = _mm256_loadu_si256((const __m256i *) (x_quant_buf + (c))); \
+    __m256i x_d = _mm256_permutevar8x32_epi32(                                 \
+        _mm256_shuffle_epi8(x_vec, deint_shuf), deint_perm);                   \
+    __m256i x_u = _mm256_xor_si256(x_d, offset_val)
 
-#undef DECODE_ROW_W
+    /* X-macro row expansion: ROWS_N(F) applies F(0) F(1) ... F(N-1) */
+#define ROWS_8(F) F(0) F(1) F(2) F(3) F(4) F(5) F(6) F(7)
+#define ROWS_4(F) F(0) F(1) F(2) F(3)
+
+    /* Per-row step macros (used by ROWS_N to eliminate unroll boilerplate) */
+#define DECL_ACC(i) __m256i acc##i = _mm256_setzero_si256();
+#define DECL_ROW_OFF(i) int row##i##_off = (r + (i)) * packed_stride;
+#define DO_DECODE(i) DECODE_ROW_W(row##i##_off, acc##i);
+#define DO_HSUM(i) int32_t total##i = hsum256_epi32(acc##i);
+#define DO_TAIL(i) \
+    total##i += UNPACK_LUT[packed_ptr[row##i##_off + byte_idx]][sub_idx] * xv;
+#define DO_STORE(i) w->out[r + (i)] = (float) total##i * inv_scale;
+
+    int r = r_start;
+
+    /* 8-row unrolling: activation deinterleave amortized across 8 rows */
+    for (; r + 8 <= r_end; r += 8) {
+        ROWS_8(DECL_ACC)
+        ROWS_8(DECL_ROW_OFF)
+
+        int c = 0;
+        for (; c + 32 <= cols; c += 32) {
+            int pack_off = c / 4;
+            LOAD_DEINTERLEAVE_ACT(c);
+            ROWS_8(DO_DECODE)
         }
 
-        int32_t total0 = hsum256_epi32(acc0);
-        int32_t total1 = hsum256_epi32(acc1);
-        int32_t total2 = hsum256_epi32(acc2);
-        int32_t total3 = hsum256_epi32(acc3);
-
+        ROWS_8(DO_HSUM)
         for (; c < cols; c++) {
             int byte_idx = c / 4;
             int sub_idx = c & 3;
             int8_t xv = x_quant_buf[c];
-            total0 += UNPACK_LUT[packed_ptr[row0_off + byte_idx]][sub_idx] * xv;
-            total1 += UNPACK_LUT[packed_ptr[row1_off + byte_idx]][sub_idx] * xv;
-            total2 += UNPACK_LUT[packed_ptr[row2_off + byte_idx]][sub_idx] * xv;
-            total3 += UNPACK_LUT[packed_ptr[row3_off + byte_idx]][sub_idx] * xv;
+            ROWS_8(DO_TAIL)
         }
-
-        w->out[r] = (float) total0 * inv_scale;
-        w->out[r + 1] = (float) total1 * inv_scale;
-        w->out[r + 2] = (float) total2 * inv_scale;
-        w->out[r + 3] = (float) total3 * inv_scale;
+        ROWS_8(DO_STORE)
     }
 
-    /* Remainder rows (1-3) */
+    /* 4-row remainder */
+    for (; r + 4 <= r_end; r += 4) {
+        ROWS_4(DECL_ACC)
+        ROWS_4(DECL_ROW_OFF)
+
+        int c = 0;
+        for (; c + 32 <= cols; c += 32) {
+            int pack_off = c / 4;
+            LOAD_DEINTERLEAVE_ACT(c);
+            ROWS_4(DO_DECODE)
+        }
+
+        ROWS_4(DO_HSUM)
+        for (; c < cols; c++) {
+            int byte_idx = c / 4;
+            int sub_idx = c & 3;
+            int8_t xv = x_quant_buf[c];
+            ROWS_4(DO_TAIL)
+        }
+        ROWS_4(DO_STORE)
+    }
+
+    /* 1-row remainder */
     for (; r < r_end; r++) {
         __m256i acc = _mm256_setzero_si256();
         int row_off = r * packed_stride;
         int c = 0;
 
         for (; c + 32 <= cols; c += 32) {
-            __m128i raw = _mm_loadl_epi64(
-                (const __m128i *) (packed_ptr + row_off + c / 4));
-            __m256i bc = _mm256_broadcastq_epi64(raw);
-            __m256i wv = _mm256_sub_epi8(
-                _mm256_min_epu8(
-                    _mm256_and_si256(_mm256_srlv_epi64(bc, shifts), mask03),
-                    two_vec),
-                one_vec);
-
-            __m256i x_vec =
-                _mm256_loadu_si256((const __m256i *) (x_quant_buf + c));
-            __m256i x_d = _mm256_permutevar8x32_epi32(
-                _mm256_shuffle_epi8(x_vec, deint_shuf), deint_perm);
-            __m256i x_u = _mm256_xor_si256(x_d, offset_val);
-
-            __m256i prod =
-                _mm256_sub_epi16(_mm256_maddubs_epi16(x_u, wv),
-                                 _mm256_maddubs_epi16(offset_val, wv));
-            acc = _mm256_add_epi32(acc, _mm256_madd_epi16(prod, ones));
+            int pack_off = c / 4;
+            LOAD_DEINTERLEAVE_ACT(c);
+            DECODE_ROW_W(row_off, acc);
         }
 
         int32_t total = hsum256_epi32(acc);
@@ -210,6 +223,17 @@ static void avx2_row_block(bitlinear_row_work_t *w, int r_start, int r_end)
         }
         w->out[r] = (float) total * inv_scale;
     }
+
+#undef DECODE_ROW_W
+#undef LOAD_DEINTERLEAVE_ACT
+#undef ROWS_8
+#undef ROWS_4
+#undef DECL_ACC
+#undef DECL_ROW_OFF
+#undef DO_DECODE
+#undef DO_HSUM
+#undef DO_TAIL
+#undef DO_STORE
 }
 
 /*
@@ -634,7 +658,8 @@ void avx2_ssm_inner(const ssm_inner_args_t *a, int idx_start, int idx_end)
  *    activations to match the transposed weight layout from shift-decode.
  * 3. maddubs with offset correction: unsigned*signed dot product avoids
  *    the 128-bit split (cvtepi8_epi16 lo/hi).
- * 4. 4-row unrolling: activation deinterleave shared across 4 rows.
+ * 4. 8-row unrolling: activation deinterleave shared across 8 rows.
+ *    X-macros (ROWS_8/ROWS_4) eliminate per-row boilerplate.
  * 5. 32-wide quantization: packs + permute writes 32 int8 per iteration.
  */
 void avx2_bitlinear_forward(const float *restrict x,
@@ -663,8 +688,8 @@ void avx2_bitlinear_forward(const float *restrict x,
      * Chunk counter starts at n_threads (chunks 0..n-1 pre-assigned by tid). */
     int n_threads = bm_get_threads();
     int cs = rows / (n_threads * 4);
-    if (cs < 4)
-        cs = 4;
+    if (cs < 8)
+        cs = 8;
     _Atomic int steal_ctr = n_threads;
     bool use_steal =
         (bm_get_numa_nodes() <= 1 && rows >= BM_PAR_THRESHOLD && n_threads > 1);
