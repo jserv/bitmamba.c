@@ -55,8 +55,8 @@ typedef struct {
     pthread_t handle;
     int tid;
     int node; /* NUMA node this worker is pinned to */
-    _Atomic unsigned int wake_gen;
-    _Atomic unsigned int last_done_gen;
+    _Atomic uint64_t wake_gen;
+    _Atomic uint64_t last_done_gen;
 } __attribute__((aligned(CACHE_LINE))) worker_t;
 
 /*
@@ -94,8 +94,8 @@ typedef struct {
     /* Dispatch metadata (written by main, read by workers after wake) */
     bm_task_fn_t fn;
     void *arg;
-    int n_active;         /* effective thread count for current dispatch */
-    unsigned int cur_gen; /* monotonic generation counter (main-thread only) */
+    int n_active;     /* effective thread count for current dispatch */
+    uint64_t cur_gen; /* monotonic generation counter (main-thread only) */
 } thread_pool_t;
 
 static thread_pool_t g_pool = {.poll_intensity = -1};
@@ -170,7 +170,7 @@ static void pin_to_cpu(pthread_t thread, int cpu)
 static void *worker_entry(void *arg)
 {
     worker_t *w = (worker_t *) arg;
-    unsigned int my_gen = 0;
+    uint64_t my_gen = 0;
     int worker_idx = w->tid - 1; /* workers[0] has tid=1, etc. */
 
     for (;;) {
@@ -473,7 +473,7 @@ void bm_parallel_for(int n_tasks, bm_task_fn_t fn, void *arg)
      * to the worker that does the matching acquire load on wake_gen.
      * Inactive workers are never signaled -- zero thundering-herd.
      */
-    unsigned int gen = ++g_pool.cur_gen;
+    uint64_t gen = ++g_pool.cur_gen;
     for (int i = 0; i < effective - 1; i++)
         atomic_store_explicit(&g_pool.workers[i].wake_gen, gen,
                               memory_order_release);
@@ -523,7 +523,7 @@ void bm_thread_pool_free(void)
 
     atomic_store_explicit(&g_pool.shutdown, 1, memory_order_relaxed);
     /* Wake ALL workers so they can see the shutdown flag */
-    unsigned int gen = ++g_pool.cur_gen;
+    uint64_t gen = ++g_pool.cur_gen;
     for (int i = 0; i < g_pool.n_workers; i++)
         atomic_store_explicit(&g_pool.workers[i].wake_gen, gen,
                               memory_order_release);

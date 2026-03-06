@@ -1,7 +1,7 @@
 # BitMamba C11 Inference Engine
 
 CC ?= gcc
-CFLAGS_BASE = -std=gnu11 -O3 -Wall -Wextra -Isrc
+CFLAGS_BASE = -std=gnu11 -O3 -Wall -Wextra -Isrc -Iexternals/linenoise
 LDFLAGS = -lm -lpthread
 
 # Detect ISA family and OS
@@ -28,6 +28,7 @@ COMMON_SRCS = \
     src/block.c \
     src/tokenizer.c \
     src/model.c \
+    src/chat.c \
     src/main.c
 COMMON_OBJS = $(COMMON_SRCS:.c=.o)
 
@@ -70,7 +71,11 @@ endif
 CFLAGS = $(CFLAGS_BASE)
 LDFLAGS += $(METAL_LDFLAGS)
 
-ALL_OBJS = $(COMMON_OBJS) $(ARCH_OBJS) $(METAL_OBJS)
+# Linenoise (line editing for chat REPL, auto-downloaded)
+LINENOISE_DIR = externals/linenoise
+LINENOISE_OBJ = $(LINENOISE_DIR)/linenoise.o
+
+ALL_OBJS = $(COMMON_OBJS) $(ARCH_OBJS) $(METAL_OBJS) $(LINENOISE_OBJ)
 
 # Download URLs
 MODEL_URL = https://huggingface.co/Zhayr1/BitMamba-2-1B/resolve/main/bitmamba_cpp/bitmamba_1b.bin
@@ -84,7 +89,7 @@ $(TARGET): $(ALL_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # Common sources: base flags only
-src/%.o: src/%.c src/bitmamba.h src/dispatch.h src/threadpool.h
+src/%.o: src/%.c src/bitmamba.h src/dispatch.h src/threadpool.h src/chat.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # AVX2 kernel: compiled with -mavx2 -mfma
@@ -102,6 +107,19 @@ src/metal/bm_shaders_source.h: src/metal/bm_shaders.metal
 # Metal GPU acceleration (pure C via ObjC runtime API)
 src/metal/bm_metal.o: src/metal/bm_metal.c src/metal/bm_metal.h src/metal/bm_shaders_source.h src/bitmamba.h src/dispatch.h
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Linenoise: auto-clone on first build
+$(LINENOISE_DIR)/linenoise.c: | $(LINENOISE_DIR)/linenoise.h
+$(LINENOISE_DIR)/linenoise.h:
+	mkdir -p $(dir $(LINENOISE_DIR))
+	rm -rf $(LINENOISE_DIR)
+	git clone --depth=1 https://github.com/antirez/linenoise $(LINENOISE_DIR)
+
+$(LINENOISE_OBJ): $(LINENOISE_DIR)/linenoise.c $(LINENOISE_DIR)/linenoise.h
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# chat.c depends on linenoise header (must be cloned before compiling)
+src/chat.o: $(LINENOISE_DIR)/linenoise.h
 
 # Helper: extract token IDs between banners, normalize whitespace
 # Usage: $(call extract_raw, ./bitmamba args...)
@@ -279,6 +297,8 @@ tokenizer.bin: vocab.json scripts/export-tokenizer.py
 
 clean:
 	rm -f $(TARGET) src/*.o src/arch/*.o src/metal/*.o src/metal/bm_shaders_source.h
+	rm -f $(LINENOISE_OBJ)
 
 distclean: clean
+	rm -rf $(LINENOISE_DIR)
 	rm -f bitmamba_1b.bin vocab.json tokenizer.bin

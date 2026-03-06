@@ -13,6 +13,7 @@
 #include <time.h>
 
 #include "bitmamba.h"
+#include "chat.h"
 #include "threadpool.h"
 
 #define HISTORY_MAX 256
@@ -50,32 +51,40 @@ static void history_push(int *history, int *len, int token)
 
 int main(int argc, char **argv)
 {
-    /* Check for --profile, --gpu, and --threads flags anywhere in args */
+    /* Check for flags anywhere in args */
     bool use_gpu = false;
     bool profile_enabled = false;
+    bool chat_mode = false;
+    const char *state_path = NULL;
+    const char *prompt_tpl = NULL;
+    bool no_template = false;
     int requested_threads = 0; /* 0 = auto-detect */
     bool seed_set = false;
     uint64_t seed = 0;
+    int repeat_limit = 0;  /* 0 = use default */
+    int newline_limit = 0; /* 0 = use default */
+    int stop_tokens[CHAT_MAX_STOP_TOKENS];
+    int n_stop_tokens = 0;
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--profile") == 0) {
+        if (!strcmp(argv[i], "--profile")) {
             profile_enabled = true;
             for (int j = i; j < argc - 1; j++)
                 argv[j] = argv[j + 1];
             argc--;
             i--;
-        } else if (strcmp(argv[i], "--gpu") == 0) {
+        } else if (!strcmp(argv[i], "--gpu")) {
             use_gpu = true;
             for (int j = i; j < argc - 1; j++)
                 argv[j] = argv[j + 1];
             argc--;
             i--;
-        } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+        } else if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
             requested_threads = parse_int(argv[i + 1], 0);
             for (int j = i; j < argc - 2; j++)
                 argv[j] = argv[j + 2];
             argc -= 2;
             i--;
-        } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+        } else if (!strcmp(argv[i], "--seed") && i + 1 < argc) {
             char *endptr;
             errno = 0;
             seed = (uint64_t) strtoull(argv[i + 1], &endptr, 10);
@@ -90,7 +99,63 @@ int main(int argc, char **argv)
                 argv[j] = argv[j + 2];
             argc -= 2;
             i--;
-        } else if (strcmp(argv[i], "--poll") == 0 && i + 1 < argc) {
+        } else if (!strcmp(argv[i], "--chat")) {
+            chat_mode = true;
+            for (int j = i; j < argc - 1; j++)
+                argv[j] = argv[j + 1];
+            argc--;
+            i--;
+        } else if (!strcmp(argv[i], "--state") && i + 1 < argc) {
+            state_path = argv[i + 1];
+            for (int j = i; j < argc - 2; j++)
+                argv[j] = argv[j + 2];
+            argc -= 2;
+            i--;
+        } else if (!strcmp(argv[i], "--template") && i + 1 < argc) {
+            prompt_tpl = argv[i + 1];
+            for (int j = i; j < argc - 2; j++)
+                argv[j] = argv[j + 2];
+            argc -= 2;
+            i--;
+        } else if (!strcmp(argv[i], "--no-template")) {
+            no_template = true;
+            for (int j = i; j < argc - 1; j++)
+                argv[j] = argv[j + 1];
+            argc--;
+            i--;
+        } else if (!strcmp(argv[i], "--repeat-limit") && i + 1 < argc) {
+            repeat_limit = parse_int(argv[i + 1], 0);
+            for (int j = i; j < argc - 2; j++)
+                argv[j] = argv[j + 2];
+            argc -= 2;
+            i--;
+        } else if (!strcmp(argv[i], "--newline-limit") && i + 1 < argc) {
+            newline_limit = parse_int(argv[i + 1], 0);
+            for (int j = i; j < argc - 2; j++)
+                argv[j] = argv[j + 2];
+            argc -= 2;
+            i--;
+        } else if (!strcmp(argv[i], "--stop-token") && i + 1 < argc) {
+            if (n_stop_tokens < CHAT_MAX_STOP_TOKENS) {
+                char *endptr;
+                errno = 0;
+                long v = strtol(argv[i + 1], &endptr, 10);
+                if (endptr == argv[i + 1] || *endptr != '\0' ||
+                    errno == ERANGE || v < 0 || v > INT_MAX) {
+                    fprintf(stderr, "Error: Invalid --stop-token value '%s'\n",
+                            argv[i + 1]);
+                    return 1;
+                }
+                stop_tokens[n_stop_tokens++] = (int) v;
+            } else {
+                fprintf(stderr, "Warning: Too many --stop-token (max %d)\n",
+                        CHAT_MAX_STOP_TOKENS);
+            }
+            for (int j = i; j < argc - 2; j++)
+                argv[j] = argv[j + 2];
+            argc -= 2;
+            i--;
+        } else if (!strcmp(argv[i], "--poll") && i + 1 < argc) {
             bm_set_poll(parse_int(argv[i + 1], 100));
             for (int j = i; j < argc - 2; j++)
                 argv[j] = argv[j + 2];
@@ -102,6 +167,75 @@ int main(int argc, char **argv)
     /* Initialize thread pool and kernel dispatch */
     bm_set_threads(requested_threads);
     dispatch_init();
+
+    /* Chat mode: only requires model path */
+    if (chat_mode) {
+        if (argc < 2) {
+            fprintf(stderr,
+                    "Usage: %s --chat [--state <file>] [--template <fmt>] "
+                    "[--no-template]\n"
+                    "       [--threads N] [--seed N] "
+                    "[--stop-token ID] [--repeat-limit N]\n"
+                    "       [--newline-limit N] <model.bin> "
+                    "[temp] [penalty] [min_p] [top_p] [top_k] "
+                    "[max_tokens]\n",
+                    argv[0]);
+            fprintf(stderr,
+                    "\nInteractive chat mode. Type text, get responses.\n"
+                    "Default template wraps input as "
+                    "\"Question: <input>\\nDetailed answer:\".\n"
+                    "Use --template to customize (%%s = user input), "
+                    "--no-template for raw.\n"
+                    "Pipe mode: echo \"prompt\" | %s --chat model.bin\n"
+                    "\nCommands: /reset, /save, /quit\n",
+                    argv[0]);
+            return 1;
+        }
+
+        fprintf(stderr, "[INFO] Threads: %d\n", bm_get_threads());
+
+        /* Load model */
+        bitmamba_model_t model = {0};
+        model.use_gpu = use_gpu;
+        if (!model_load(&model, argv[1]))
+            return 1;
+
+        /* Load tokenizer (required for chat) */
+        gpt2_tokenizer_t tokenizer = {0};
+        if (!tokenizer_load(&tokenizer, "tokenizer.bin")) {
+            model_free(&model);
+            return 1;
+        }
+
+        rng_seed(seed_set ? (seed ? seed : 1) : (uint64_t) time(NULL));
+
+        /* Parse optional sampling parameters */
+        chat_config_t chat_cfg = {
+            .temp = (argc > 2) ? parse_float(argv[2], 0.8f) : 0.8f,
+            .penalty = (argc > 3) ? parse_float(argv[3], 1.15f) : 1.15f,
+            .min_p = (argc > 4) ? parse_float(argv[4], 0.05f) : 0.05f,
+            .top_p = (argc > 5) ? parse_float(argv[5], 0.9f) : 0.9f,
+            .top_k = (argc > 6) ? parse_int(argv[6], 40) : 40,
+            .max_tokens = (argc > 7) ? parse_int(argv[7], 400) : 400,
+            .state_path = state_path,
+            .prompt_tpl = no_template  ? NULL
+                          : prompt_tpl ? prompt_tpl
+                                       : "Question: %s\nDetailed answer:",
+            .pipe_mode = false,
+            .repeat_limit = repeat_limit,
+            .newline_limit = newline_limit,
+            .n_stop_tokens = n_stop_tokens,
+        };
+        memcpy(chat_cfg.stop_tokens, stop_tokens,
+               (size_t) n_stop_tokens * sizeof(int));
+
+        int ret = chat_run(&model, &tokenizer, &chat_cfg);
+
+        tokenizer_free(&tokenizer);
+        model_free(&model);
+        bm_thread_pool_free();
+        return ret;
+    }
 
     if (argc < 4) {
         fprintf(stderr,
@@ -125,6 +259,14 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "  --poll 0-100 - Poll intensity (0=condvar, 100=spin, "
                 "default: 100)\n");
+        fprintf(stderr, "  --chat      - Interactive chat mode\n");
+        fprintf(stderr,
+                "  --state F   - SSM state file for chat persistence\n");
+        fprintf(stderr,
+                "  --template  - Chat prompt template (%%s = input, "
+                "default: \"Question: %%s\\nDetailed answer:\")\n");
+        fprintf(stderr,
+                "  --no-template - Disable prompt template (raw input)\n");
         fprintf(stderr, "\nParameters:\n");
         fprintf(stderr, "  model.bin   - Path to model file\n");
         fprintf(stderr,
@@ -154,17 +296,21 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "  With profiling: ./bitmamba --profile model.bin \"Hello\" "
                 "tokenizer\n");
+        fprintf(stderr, "  Chat mode:      ./bitmamba --chat model.bin\n");
+        fprintf(stderr,
+                "  Pipe mode:      echo \"Hello\" | ./bitmamba --chat "
+                "model.bin\n");
         return 1;
     }
 
     /* Validate mode */
     const char *mode = argv[3];
-    if (strcmp(mode, "tokenizer") != 0 && strcmp(mode, "raw") != 0) {
+    if (strcmp(mode, "tokenizer") && strcmp(mode, "raw")) {
         fprintf(stderr, "Error: Invalid mode '%s'\n", mode);
         fprintf(stderr, "Mode must be either 'tokenizer' or 'raw'\n");
         return 1;
     }
-    bool use_tokenizer = (strcmp(mode, "tokenizer") == 0);
+    bool use_tokenizer = !strcmp(mode, "tokenizer");
 
     /* Parse optional parameters (matching C++ defaults) */
     float temp = 0.8f;
@@ -192,7 +338,7 @@ int main(int argc, char **argv)
 
     /* Check for optional output mode */
     bool is_clean = false;
-    if (argc > 10 && strcmp(argv[10], "clean") == 0)
+    if (argc > 10 && !strcmp(argv[10], "clean"))
         is_clean = true;
 
     if (!is_clean)
@@ -253,7 +399,19 @@ int main(int argc, char **argv)
         }
         char *tok = strtok(input_copy, " ");
         while (tok && n_prompt < 1024) {
-            prompt_ids[n_prompt++] = parse_int(tok, 0);
+            char *endptr;
+            errno = 0;
+            long v = strtol(tok, &endptr, 10);
+            if (endptr == tok || *endptr != '\0' || errno == ERANGE || v < 0 ||
+                v > INT_MAX) {
+                fprintf(stderr, "Error: Invalid token ID '%s' in raw input\n",
+                        tok);
+                free(input_copy);
+                free(prompt_ids);
+                model_free(&model);
+                return 1;
+            }
+            prompt_ids[n_prompt++] = (int32_t) v;
             tok = strtok(NULL, " ");
         }
         free(input_copy);

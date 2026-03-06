@@ -23,6 +23,27 @@
 #define TOKEN_NLNL 628
 #define TOKEN_PERIOD 13
 
+/* GPT-2 turn-boundary markers (used by chat mode to detect new turns).
+ * These are GPT-2 byte-pair encoding IDs for specific word tokens. */
+#define TOKEN_Q 48           /* "Q" */
+#define TOKEN_QUESTION 24361 /* "Question" */
+#define TOKEN_A_UC 32        /* "A" */
+#define TOKEN_B_UC 33        /* "B" */
+#define TOKEN_C_UC 34        /* "C" */
+#define TOKEN_D_UC 35        /* "D" */
+#define TOKEN_WHAT 2061      /* "What" */
+#define TOKEN_HOW 2437       /* "How" */
+#define TOKEN_WHY 5195       /* "Why" */
+#define TOKEN_WHEN 2215      /* "When" */
+#define TOKEN_WHERE 8496     /* "Where" */
+#define TOKEN_IS_UC 3792     /* "Is" */
+#define TOKEN_ARE_UC 8491    /* "Are" */
+#define TOKEN_DO_UC 5211     /* "Do" */
+#define TOKEN_DOES 13921     /* "Does" */
+#define TOKEN_CAN_UC 6090    /* "Can" */
+#define TOKEN_ANSWER 23998   /* "Answer" (with leading space) */
+#define TOKEN_ANSWER2 33706  /* "Answer" (no leading space) */
+
 /* BitMamba2 architecture constants */
 #define BM_EXPAND_FACTOR 2 /* d_inner = d_model * BM_EXPAND_FACTOR */
 #define BM_CONV_KERNEL 4   /* Conv1d kernel width */

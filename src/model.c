@@ -504,7 +504,25 @@ bool model_load(bitmamba_model_t *m, const char *path)
     if (m->use_gpu)
         mmap_prot |= PROT_WRITE;
 #endif
-    m->mmap_addr = mmap(NULL, m->mmap_size, mmap_prot, MAP_PRIVATE, fd, 0);
+    /* Readahead hint: tell the kernel we will read sequentially.
+     * This triggers aggressive prefetching, reducing I/O stalls during
+     * model loading and layer-by-layer weight access.
+     * The forward pass accesses layer weights sequentially, so the OS
+     * automatically pages in needed weights and evicts old ones.
+     */
+#ifdef __linux__
+    posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+
+    int mmap_flags = MAP_PRIVATE;
+#ifdef __linux__
+    /* Prefault all pages at load time, moving page faults from first
+     * inference to model load. For ~350 MB model, this avoids ~85K
+     * individual faults during the first forward pass. */
+    mmap_flags |= MAP_POPULATE;
+#endif
+
+    m->mmap_addr = mmap(NULL, m->mmap_size, mmap_prot, mmap_flags, fd, 0);
     close(fd);
 
     if (m->mmap_addr == MAP_FAILED) {
@@ -512,6 +530,14 @@ bool model_load(bitmamba_model_t *m, const char *path)
         m->mmap_addr = NULL;
         return false;
     }
+
+    /* Sequential access hint for layer-by-layer weight access.
+     * MADV_SEQUENTIAL tells the kernel to prefetch ahead and release
+     * pages behind the access point, critical for models larger than RAM.
+     * Embedding and weight pages are demand-paged as accessed during
+     * inference; the OS evicts stale pages under memory pressure.
+     */
+    madvise(m->mmap_addr, m->mmap_size, MADV_SEQUENTIAL);
 
     /* Parse header with bounds checking */
     const uint8_t *ptr = (const uint8_t *) m->mmap_addr;
@@ -936,8 +962,8 @@ static bool model_prefill_metal(bitmamba_model_t *m,
         int tok = tokens[t];
         if (tok < 0 || tok >= m->config.vocab_size)
             tok = 0;
-        memcpy(x_batch + t * d_model, &m->embed.data[tok * d_model],
-               d_model * sizeof(float));
+        float *dst = x_batch + t * d_model;
+        memcpy(dst, &m->embed.data[tok * d_model], d_model * sizeof(float));
     }
 
     /* Pipelined Execution:
@@ -1041,22 +1067,36 @@ void model_prefill(bitmamba_model_t *m, const int32_t *tokens, int n_tokens)
     /* Quantization stride: input dim padded to +32 for NEON overread safety */
     int quant_stride = d_inner + 32;
 
-    /* Grow-on-demand scratch buffers (reused across prefill calls) */
+    /* Grow-on-demand scratch buffers (reused across prefill calls).
+     * Overflow check: all multiply chains use size_t to detect wrap. */
     if (n_tokens > m->pf_capacity) {
+        size_t nt = (size_t) n_tokens;
+        size_t sz_x = nt * (size_t) d_model * sizeof(float);
+        size_t sz_proj = nt * (size_t) max_proj * sizeof(float);
+        size_t sz_y = nt * (size_t) d_inner * sizeof(float);
+        size_t sz_q = nt * (size_t) quant_stride * sizeof(int8_t);
+
+        /* Check for overflow: if any product wraps around zero, bail */
+        if ((d_model && sz_x / (size_t) d_model / sizeof(float) != nt) ||
+            (max_proj && sz_proj / (size_t) max_proj / sizeof(float) != nt) ||
+            (d_inner && sz_y / (size_t) d_inner / sizeof(float) != nt) ||
+            (quant_stride && sz_q / (size_t) quant_stride != nt)) {
+            fprintf(stderr,
+                    "Error: Prefill allocation overflow (n_tokens=%d)\n",
+                    n_tokens);
+            return;
+        }
+
         free(m->pf_x_batch);
         free(m->pf_out_batch);
         free(m->pf_proj_batch);
         free(m->pf_y_batch);
         free(m->pf_quant_batch);
-        m->pf_x_batch = xmalloc_aligned(
-            (size_t) n_tokens * d_model * sizeof(float), BM_BUF_ALIGN);
-        m->pf_out_batch = xmalloc_aligned(
-            (size_t) n_tokens * d_model * sizeof(float), BM_BUF_ALIGN);
-        m->pf_proj_batch = xmalloc_aligned(
-            (size_t) n_tokens * max_proj * sizeof(float), BM_BUF_ALIGN);
-        m->pf_y_batch = xmalloc_aligned(
-            (size_t) n_tokens * d_inner * sizeof(float), BM_BUF_ALIGN);
-        m->pf_quant_batch = xcalloc_aligned((size_t) n_tokens * quant_stride,
+        m->pf_x_batch = xmalloc_aligned(sz_x, BM_BUF_ALIGN);
+        m->pf_out_batch = xmalloc_aligned(sz_x, BM_BUF_ALIGN);
+        m->pf_proj_batch = xmalloc_aligned(sz_proj, BM_BUF_ALIGN);
+        m->pf_y_batch = xmalloc_aligned(sz_y, BM_BUF_ALIGN);
+        m->pf_quant_batch = xcalloc_aligned(nt * (size_t) quant_stride,
                                             sizeof(int8_t), BM_BUF_ALIGN);
         m->pf_capacity = n_tokens;
     }
@@ -1078,8 +1118,8 @@ void model_prefill(bitmamba_model_t *m, const int32_t *tokens, int n_tokens)
             fprintf(stderr, "Error: Invalid token ID %d in prefill\n", tok);
             tok = 0;
         }
-        memcpy(x_batch + t * d_model, &m->embed.data[tok * d_model],
-               d_model * sizeof(float));
+        float *dst = x_batch + t * d_model;
+        memcpy(dst, &m->embed.data[tok * d_model], d_model * sizeof(float));
     }
 
     if (m->profile_enabled) {
@@ -1152,7 +1192,10 @@ int model_forward_step(bitmamba_model_t *m,
         return 0;
     }
 
-    /* Embedding lookup */
+    /* Embedding lookup: copy from mmap'd FP32 table.
+     * The OS demand-pages embed rows as needed (one 8 KB row per token)
+     * and evicts stale pages under memory pressure.
+     */
     if (m->profile_enabled)
         t0 = get_time_ms();
     memcpy(m->current_x, &m->embed.data[token * d_model],
@@ -1286,6 +1329,8 @@ void model_free(bitmamba_model_t *m)
             m->lm_head_packed_numa[i] = NULL;
         }
     }
+
+    /* Free FP16 embedding compression buffer */
 
     /* Tensor data points into mmap'd region - just null them */
     m->embed.data = NULL;

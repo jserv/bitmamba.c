@@ -289,6 +289,14 @@ bool bm_metal_set_mmap(const void *base, size_t size)
 
     pthread_mutex_lock(&g_metal_mutex);
 
+    /* Release previous mmap buffer if replacing */
+    if (g_mmap_buf) {
+        release(g_mmap_buf);
+        g_mmap_buf = NULL;
+        g_mmap_base = NULL;
+        g_mmap_len = 0;
+    }
+
     /* Page-align length upward (mmap base is already page-aligned) */
     long page = getpagesize();
     size_t aligned_len = (size + (size_t) page - 1) & ~((size_t) page - 1);

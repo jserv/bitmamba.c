@@ -58,6 +58,9 @@ ISA detection, with no dependencies beyond a C compiler and POSIX.
 - Persistent spin-wait thread pool with `--threads N` (auto-detects P-cores on Apple Silicon)
 - Per-stage profiling (`--profile` flag)
 - GPU offload for batch prefill (`--gpu` flag, Apple Metal)
+- Interactive chat mode (`--chat`) with multi-turn SSM state persistence
+- Built-in arithmetic evaluator and comparison solver (no shell dependency)
+- Query rewriting for improved base-model completions
 
 ## Performance
 
@@ -141,6 +144,46 @@ Parameters:
 ./bitmamba --gpu bitmamba_1b.bin "15496 11 314 716" raw 0.0
 ```
 
+### Chat Mode
+
+Interactive multi-turn conversation using Mamba's fixed-size SSM state.
+No growing KV cache or context window limit -- memory stays constant
+across turns.
+
+```shell
+# Interactive REPL (Ctrl-D or /quit to exit)
+./bitmamba --chat bitmamba_1b.bin
+
+# Pipe mode (single prompt, no REPL)
+echo "Where is Tokyo?" | ./bitmamba --chat bitmamba_1b.bin
+
+# Custom sampling parameters
+./bitmamba --chat bitmamba_1b.bin 0.8 1.15 0.05 0.9 40 400
+
+# Save/load SSM state across sessions
+./bitmamba --chat --state session.bin bitmamba_1b.bin
+
+# Custom prompt template (%s = user input)
+./bitmamba --chat --template 'Q: %s\nA:' bitmamba_1b.bin
+
+# Raw mode (no template wrapping)
+./bitmamba --chat --no-template bitmamba_1b.bin
+```
+
+Chat mode features:
+- Default template `"Question: %s\nDetailed answer:"` for informative
+  base-model completions
+- Built-in arithmetic evaluator: `2+3*4` returns `14`, `3^2^2` returns `81`
+- Comparison solver: `4*4 vs 3*3` returns `4*4 = 16, 3*3 = 9, so the first is larger.`
+- English number words: `twenty three plus forty two` returns `65`
+- Query rewriting expands short questions for better output
+  (e.g., "Where is X?" becomes "Where is X located, and what is it known for?")
+- Turn-boundary detection prevents the model from rambling into new questions
+- SSM state persistence (`--state`) enables multi-session conversations
+- REPL commands: `/reset`, `/save`, `/help`, `/quit` (Tab completion)
+- Configurable stop conditions: `--stop-token ID`, `--newline-limit N`,
+  `--repeat-limit N`
+
 ## Documentation
 
 The [docs/](docs/) directory contains detailed technical documentation:
@@ -159,6 +202,7 @@ src/
   bitmamba.h         Shared types, constants, API declarations
   dispatch.h/.c      Runtime kernel dispatch table
   main.c             CLI entry point, generation loop
+  chat.c/.h          Interactive chat mode, math evaluator, state persistence
   model.c            mmap model loading, forward pass, sampling
   kernel.c           Scalar T-MAC bitlinear, RMS norm, activations
   block.c            Mamba-2 block (SSM + conv1d) forward pass
