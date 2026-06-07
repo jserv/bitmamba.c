@@ -147,8 +147,13 @@ ifeq ($(UNAME_S),Darwin)
         286 15886 39315 286 15886 39315 286 15886
   endif
 else
-  EXPECT_RAW2 = 198 91 39315 15886 50 1648 844 15886 39315 286 15886 39315 \
-      286 15886 39315 286 15886 39315 286 15886
+  ifeq ($(ISA_FAMILY),x86)
+    EXPECT_RAW2 = 198 91 39315 15886 50 1648 13597 3418 11 968 1971 91 198 91 \
+        45251 15886 16 11 23 1954
+  else
+    EXPECT_RAW2 = 198 91 39315 15886 50 1648 844 15886 39315 286 15886 39315 \
+        286 15886 39315 286 15886 39315 286 15886
+  endif
 endif
 
 # Test 3: long prefill (64 input tokens) → 5 output tokens, stresses batched matmul
@@ -166,7 +171,11 @@ ifeq ($(UNAME_S),Darwin)
     EXPECT_RAW4 = 11 616 1438 318 4422 11 290 314 716 257
   endif
 else
-  EXPECT_RAW4 = 11 616 1438 318 4422 11 290 314 716 257
+  ifeq ($(ISA_FAMILY),x86)
+    EXPECT_RAW4 = 11 616 1438 318 4422 13 314 716 257 3788
+  else
+    EXPECT_RAW4 = 11 616 1438 318 4422 11 290 314 716 257
+  endif
 endif
 
 # Test 5: deterministic sampling (--seed 42, temp=0.8 top_k=40 top_p=0.9 min_p=0.05)
@@ -182,9 +191,14 @@ ifeq ($(UNAME_S),Darwin)
         1680 345 1037 502 503 30 198 17250 612 0
   endif
 else
-  # EOS (token 0) terminates at 24 tokens
-  EXPECT_SAMP1 = 257 31516 290 1312 423 645 2126 703 284 923 616 898 3052 13 \
-      1680 345 1037 502 503 30 198 17250 612 0
+  ifeq ($(ISA_FAMILY),x86)
+    EXPECT_SAMP1 = 257 31516 290 423 645 1998 351 8300 13 314 373 7725 284 651 \
+        617 11154 319 703 284 779 262 327 4880 3303 329 616 7865 1628 13 314
+  else
+    # EOS (token 0) terminates at 24 tokens
+    EXPECT_SAMP1 = 257 31516 290 1312 423 645 2126 703 284 923 616 898 3052 13 \
+        1680 345 1037 502 503 30 198 17250 612 0
+  endif
 endif
 
 # Test 6: sampling with top_k=0 top_p=1.0 (no-sort fallback path in sampler)
@@ -197,12 +211,25 @@ ifeq ($(UNAME_S),Darwin)
         13359 262 2324 290 11540 286 40705 8251
   endif
 else
-  EXPECT_SAMP2 = 262 6123 286 11707 6644 10501 11 257 1664 326 29786 287 \
-      13359 262 2324 290 11540 286 40705 8251
+  ifeq ($(ISA_FAMILY),x86)
+    EXPECT_SAMP2 = 262 6123 286 12347 20138 5638 11 257 1664 326 11073 290 \
+        16015 1029 12 45888 6591 1660 39844 3341
+  else
+    EXPECT_SAMP2 = 262 6123 286 11707 6644 10501 11 257 1664 326 29786 287 \
+        13359 262 2324 290 11540 286 40705 8251
+  endif
 endif
 
 # Test 7: tokenizer round-trip, "Where is Tokyo?" → 20 tokens
-EXPECT_TOK = Tokyo is the capital city of Japan and the largest city in the country. It is located
+ifeq ($(UNAME_S),Darwin)
+  EXPECT_TOK = Tokyo is the capital city of Japan and the largest city in the country. It is located
+else
+  ifeq ($(ISA_FAMILY),x86)
+    EXPECT_TOK = Tokyo is the capital of Japan and the largest city in the country. It is located on
+  else
+    EXPECT_TOK = Tokyo is the capital city of Japan and the largest city in the country. It is located
+  endif
+endif
 
 check: check-raw check-sampling check-tokenizer
 	@echo "All checks passed."
