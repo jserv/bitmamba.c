@@ -786,7 +786,7 @@ bool model_load(bitmamba_model_t *m, const char *path)
     /* Precompute per-head A constants: -exp(A_log[h]) */
     for (int i = 0; i < m->config.n_layers; i++) {
         bitmamba_block_t *b = &m->layers[i];
-        b->A_precomp = xmalloc(b->n_heads * sizeof(float));
+        b->A_precomp = xcalloc(b->n_heads, sizeof(float));
         for (int h = 0; h < b->n_heads; h++)
             b->A_precomp[h] = -expf(b->A_log.data[h]);
     }
@@ -819,7 +819,7 @@ bool model_load(bitmamba_model_t *m, const char *path)
     m->final_feat = xmalloc_aligned(d_model * sizeof(float), BM_BUF_ALIGN);
     m->logits =
         xmalloc_aligned(m->config.vocab_size * sizeof(float), BM_BUF_ALIGN);
-    m->sampler_probs = xmalloc(m->config.vocab_size * sizeof(token_prob_t));
+    m->sampler_probs = xcalloc(m->config.vocab_size, sizeof(token_prob_t));
 
     /* Repetition penalty dedup bitset (reused across forward steps) */
     {
